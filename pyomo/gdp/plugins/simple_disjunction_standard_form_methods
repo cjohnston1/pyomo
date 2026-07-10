@@ -1,0 +1,204 @@
+"""
+Solve a linear objective over a box (defined by per-variable bounds), find the
+corner of the box that optimises it, and test whether that corner satisfies or
+violates a GDP disjunction.
+
+This is deliberately a plain method, NOT a GDP transformation: it does not
+reformulate or rewrite the model, it just probes a single point.
+"""
+
+from collections import namedtuple
+
+from pyomo.environ import (
+    ConcreteModel, Var, Objective, Constraint, Reals,
+    minimize, maximize, value, SolverFactory,
+)
+from pyomo.core.expr import identify_variables
+from pyomo.repn import generate_standard_repn
+from pyomo.common.collections import ComponentMap, ComponentSet
+
+
+BoxCornerCheck = namedtuple(
+    "BoxCornerCheck",
+    ["corner", "violates", "satisfied_disjuncts", "objective_value"],
+)
+
+
+def variables_in_disjunction(disjunction):
+    """Every VarData that appears in any (active) constraint of any disjunct."""
+    seen = ComponentSet()
+    for disjunct in disjunction.disjuncts:
+        for con in disjunct.component_data_objects(
+            Constraint, active=True, descend_into=True
+        ):
+            for v in identify_variables(con.body, include_fixed=True):
+                seen.add(v)
+    return seen
+
+
+def check_box_corner_against_disjunction(
+    disjunction,
+    bounds,
+    objective_expr,
+    sense=minimize,
+    solver=None,
+    tol=1e-6,
+    zero_coef_bound="lower",
+):
+    """
+    Optimise a linear objective over a box, then test the resulting corner
+    against a disjunction.
+
+    Parameters
+    ----------
+    disjunction : DisjunctionData
+        A single (scalar) GDP disjunction, e.g. ``m.d`` or ``m.d[i]``.
+    bounds : mapping {VarData: (lb, ub)}
+        Lower/upper bound defining the box.  Must cover every variable that
+        appears in the disjunction.
+    objective_expr : Pyomo expression
+        A *linear* objective in the box variables.
+    sense : minimize | maximize
+    solver : None | str | solver object
+        None (default) solves the LP in closed form -- a linear objective over
+        a box is optimised at a vertex, so the corner can be read straight off
+        the sign of each coefficient, no solver required.  Pass e.g. "glpk"
+        (or any simplex LP solver / SolverFactory object) to solve the LP with
+        an actual solver instead; a simplex solver also returns a vertex.
+    tol : float
+        Feasibility tolerance for the disjunct-constraint test.
+    zero_coef_bound : "lower" | "upper"
+        Bound to send a variable to when the objective is indifferent to it
+        (coefficient 0), so the returned point is always a true corner.
+        Closed-form path only.
+
+    Returns
+    -------
+    BoxCornerCheck(corner, violates, satisfied_disjuncts, objective_value)
+        corner              : ComponentMap {VarData: float}, the optimal vertex.
+        violates            : bool, True iff the corner satisfies NO disjunct
+                              (i.e. the corner is outside the feasible set the
+                              disjunction describes).
+        satisfied_disjuncts : list of DisjunctData satisfied at the corner.
+        objective_value     : float, objective value at the corner.
+    """
+    bounds = ComponentMap(
+        bounds.items() if hasattr(bounds, "items") else bounds
+    )
+
+    # 1. every disjunction variable must have a box ---------------------------
+    missing = [v for v in variables_in_disjunction(disjunction)
+               if v not in bounds]
+    if missing:
+        raise ValueError(
+            "No bounds supplied for: " + ", ".join(v.name for v in missing)
+        )
+    box_vars = list(bounds)
+
+    # 2. optimal corner -------------------------------------------------------
+    if solver is None:
+        corner = _corner_closed_form(
+            objective_expr, sense, bounds, box_vars, zero_coef_bound
+        )
+    else:
+        corner = _corner_by_lp(objective_expr, sense, bounds, box_vars, solver)
+
+    # 3. evaluate objective + test the disjunction at that corner -------------
+    with _values_set_to(corner):
+        obj_val = value(objective_expr, exception=False)
+        satisfied = [d for d in disjunction.disjuncts if _disjunct_holds(d, tol)]
+
+    return BoxCornerCheck(corner, len(satisfied) == 0, satisfied, obj_val)
+
+
+# --------------------------------------------------------------------------- #
+# corner finders
+# --------------------------------------------------------------------------- #
+def _linear_coefficients(objective_expr):
+    repn = generate_standard_repn(objective_expr, quadratic=False)
+    if repn.nonlinear_expr is not None:
+        raise ValueError(
+            "Objective is nonlinear; its optimum over the box need not be a "
+            "corner.  Supply an NLP solver via solver=... if you still want it."
+        )
+    coef = ComponentMap()
+    for c, v in zip(repn.linear_coefs, repn.linear_vars):
+        coef[v] = coef.get(v, 0.0) + c
+    return coef
+
+
+def _corner_closed_form(objective_expr, sense, bounds, box_vars, zero_coef_bound):
+    coef = _linear_coefficients(objective_expr)
+    corner = ComponentMap()
+    for v in box_vars:
+        lb, ub = bounds[v]
+        c = coef.get(v, 0.0)
+        if sense == maximize:
+            c = -c
+        # minimising c * v over [lb, ub]
+        if c > 0:
+            pick = lb
+        elif c < 0:
+            pick = ub
+        else:
+            pick = lb if zero_coef_bound == "lower" else ub
+        if pick is None:
+            raise ValueError(
+                f"LP is unbounded: objective pushes {v.name} to a missing bound."
+            )
+        corner[v] = pick
+    return corner
+
+
+def _corner_by_lp(objective_expr, sense, bounds, box_vars, solver):
+    coef = _linear_coefficients(objective_expr)
+    m = ConcreteModel()
+    m.x = Var(range(len(box_vars)), domain=Reals)
+    for i, v in enumerate(box_vars):
+        lb, ub = bounds[v]
+        m.x[i].setlb(lb)
+        m.x[i].setub(ub)
+    m.obj = Objective(
+        expr=sum(coef.get(v, 0.0) * m.x[i] for i, v in enumerate(box_vars)),
+        sense=sense,
+    )
+    opt = SolverFactory(solver) if isinstance(solver, str) else solver
+    opt.solve(m)
+    # a simplex LP solver returns a basic feasible solution == a vertex == corner
+    return ComponentMap((v, value(m.x[i])) for i, v in enumerate(box_vars))
+
+
+# --------------------------------------------------------------------------- #
+# point evaluation against the disjunction
+# --------------------------------------------------------------------------- #
+class _values_set_to:
+    """Temporarily assign VarData values, restoring them on exit."""
+    def __init__(self, corner):
+        self.corner = corner
+        self.saved = None
+
+    def __enter__(self):
+        self.saved = ComponentMap((v, v.value) for v in self.corner)
+        for v, val in self.corner.items():
+            v.set_value(val, skip_validation=True)
+        return self
+
+    def __exit__(self, *exc):
+        for v, val in self.saved.items():
+            v.set_value(val, skip_validation=True)
+        return False
+
+
+def _disjunct_holds(disjunct, tol):
+    """True iff every active constraint of the disjunct holds within tol."""
+    for con in disjunct.component_data_objects(
+        Constraint, active=True, descend_into=True
+    ):
+        body = value(con.body, exception=False)
+        if body is None:                       # unevaluable -> treat as not held
+            return False
+        if con.has_lb() and body < value(con.lower) - tol:
+            return False
+        if con.has_ub() and body > value(con.upper) + tol:
+            return False
+    return True
